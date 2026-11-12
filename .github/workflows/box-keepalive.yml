@@ -1,0 +1,83 @@
+# GitHub Actions keep-alive for TWO Simular Boxes (corrected dual-box version).
+# Runs in GitHub's cloud (always on, independent of your PC) and pings both boxes.
+#
+# Why not strategy.matrix: GitHub does NOT allow the `secrets` context inside
+# `strategy.matrix`, so `matrix.include[].id: ${{ secrets.BOX1_ID }}` resolves
+# empty and the job fails. Secrets are read in a normal step `env` below instead.
+#
+# Setup:
+#   1) Put this file at: .github/workflows/box-keepalive.yml  (default branch)
+#   2) Repo Settings -> Secrets and variables -> Actions -> New repository secret:
+#        BOX1_ID     = cb-xxxxxxxxxxxx     (box of account 1)
+#        BOX1_TOKEN  = cb_...              (personal key of account 1)
+#        BOX2_ID     = cb-yyyyyyyyyyyy     (box of account 2)
+#        BOX2_TOKEN  = cb_...              (personal key of account 2)
+#   3) Actions tab -> "box-keepalive" -> Run workflow (manual first test).
+#   4) Check the run log shows "OK box 1 / OK box 2".
+#
+# Notes:
+#   - GitHub cron minimum is 5 min; scheduled runs are best-effort and often
+#     delayed. Idle-sleep is ~40 min, so 5-20 min interval is plenty.
+#   - Scheduled workflows are disabled after ~60 days of repo inactivity; any
+#     commit re-enables. Also they only run on the DEFAULT branch.
+#   - Private repo: each run bills ~1 min, so 5-min cron (~8600 min/month)
+#     exceeds the 2000 free minutes -> use a PUBLIC repo (free/unlimited) or
+#     slow the cron to */20 or */30.
+
+name: box-keepalive
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: box-keepalive
+  cancel-in-progress: false
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping boxes
+        env:
+          BOX1_ID: ${{ secrets.BOX1_ID }}
+          BOX1_TOKEN: ${{ secrets.BOX1_TOKEN }}
+          BOX2_ID: ${{ secrets.BOX2_ID }}
+          BOX2_TOKEN: ${{ secrets.BOX2_TOKEN }}
+        run: |
+          set -uo pipefail
+          ping() {
+            local id="$1" token="$2"
+            if [ -z "$id" ] || [ -z "$token" ]; then
+              echo "skip: empty box id/token"; return 0
+            fi
+            local url="https://mcp.box.simular.ai/mcp/$id"
+            local accept='Accept: application/json, text/event-stream'
+            local hdr body sid
+            hdr=$(mktemp); body=$(mktemp)
+            if ! curl -sS -D "$hdr" -o "$body" --max-time 25 -X POST "$url" \
+              -H "Authorization: Bearer $token" -H "Content-Type: application/json" -H "$accept" \
+              -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"gh-keepalive","version":"1"}}}'; then
+              echo "ERROR initialize failed"; return 1
+            fi
+            sid=$(awk 'BEGIN{IGNORECASE=1} /^mcp-session-id:/{gsub(/\r/,"");print $2}' "$hdr" | tail -1)
+            if [ -z "$sid" ]; then echo "ERROR no mcp-session-id"; sed 's/Bearer .*/Bearer ***/' "$hdr"; return 1; fi
+            curl -sS -o /dev/null --max-time 20 -X POST "$url" \
+              -H "Authorization: Bearer $token" -H "Content-Type: application/json" -H "$accept" \
+              -H "mcp-session-id: $sid" \
+              -d '{"jsonrpc":"2.0","method":"notifications/initialized"}' || true
+            curl -sS -o "$body" --max-time 30 -X POST "$url" \
+              -H "Authorization: Bearer $token" -H "Content-Type: application/json" -H "$accept" \
+              -H "mcp-session-id: $sid" \
+              -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"shell","arguments":{"command":"date -u +%FT%TZ"}}}'
+            if grep -q '"result"' "$body"; then echo "OK"; else echo "WARN no-result"; cat "$body"; fi
+            curl -sS -o /dev/null --max-time 15 -X DELETE "$url" \
+              -H "Authorization: Bearer $token" -H "mcp-session-id: $sid" || true
+          }
+          rc=0
+          echo "== box 1 =="; ping "${BOX1_ID:-}" "${BOX1_TOKEN:-}" || rc=1
+          echo "== box 2 =="; ping "${BOX2_ID:-}" "${BOX2_TOKEN:-}" || rc=1
+          exit $rc
